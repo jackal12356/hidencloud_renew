@@ -73,7 +73,8 @@ class HidenCloud:
         logger.info(f"正在尝试更新 GitHub Secret: {secret_name}")
         headers = {
             "Authorization": f"token {gh_pat}",
-            "Accept": "application/vnd.github.v3+json"
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "HidenCloud-Renew-Bot"
         }
 
         try:
