@@ -4,6 +4,9 @@ import os
 import re
 import time
 import base64
+import subprocess
+import tempfile
+import shutil
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
@@ -21,12 +24,131 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── 代理支持 ──────────────────────────────────────────────
+_xray_proc = None          # xray 子进程句柄
+PROXY_SOCKS5 = "socks5://127.0.0.1:10808"
+PROXY_HTTP   = "http://127.0.0.1:10809"
+
+def _parse_vmess(vmess_url: str) -> dict:
+    """解析 vmess:// 链接，返回配置字典"""
+    b64 = vmess_url.replace("vmess://", "").strip()
+    # 补全 base64 padding
+    b64 += "=" * (-len(b64) % 4)
+    return json.loads(base64.b64decode(b64).decode("utf-8"))
+
+def _build_xray_config(v: dict, socks_port=10808, http_port=10809) -> dict:
+    """根据 vmess 参数生成 xray inbound+outbound 配置"""
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True}
+            },
+            {
+                "port": http_port,
+                "protocol": "http",
+                "settings": {}
+            }
+        ],
+        "outbounds": [
+            {
+                "protocol": "vmess",
+                "settings": {
+                    "vnext": [{
+                        "address": v["add"],
+                        "port": int(v["port"]),
+                        "users": [{
+                            "id": v["id"],
+                            "alterId": int(v.get("aid", 0)),
+                            "security": v.get("scy", "auto")
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": v.get("net", "tcp"),
+                    "security": v.get("tls", ""),
+                    "tlsSettings": {
+                        "serverName": v.get("sni") or v.get("host", ""),
+                        "allowInsecure": v.get("insecure", "0") == "1",
+                        "fingerprint": v.get("fp", "")
+                    } if v.get("tls") == "tls" else {},
+                    "wsSettings": {
+                        "path": v.get("path", "/"),
+                        "headers": {"Host": v.get("host", "")}
+                    } if v.get("net") == "ws" else {}
+                }
+            },
+            {"protocol": "freedom", "tag": "direct"}
+        ]
+    }
+
+def setup_proxy(vmess_url: str) -> bool:
+    """
+    解析 vmess 链接，写入 xray 配置并启动本地代理。
+    需要系统中已安装 xray（GitHub Actions 可在 workflow 中 apt/下载安装）。
+    返回 True 表示成功启动。
+    """
+    global _xray_proc
+
+    if not vmess_url:
+        logger.info("未设置 VMESS_LINK，跳过代理配置，使用直连")
+        return False
+
+    xray_bin = shutil.which("xray") or shutil.which("xray-linux-64")
+    if not xray_bin:
+        logger.warning("未找到 xray 可执行文件，跳过代理。请在 workflow 中安装 xray")
+        return False
+
+    try:
+        v = _parse_vmess(vmess_url)
+        cfg = _build_xray_config(v)
+        cfg_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="xray_cfg_"
+        )
+        json.dump(cfg, cfg_file, ensure_ascii=False, indent=2)
+        cfg_file.close()
+
+        logger.info(f"启动 xray 代理 → {v['add']}:{v['port']} (via {v.get('net','tcp')})")
+        _xray_proc = subprocess.Popen(
+            [xray_bin, "run", "-c", cfg_file.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(2)  # 等待 xray 就绪
+        if _xray_proc.poll() is not None:
+            logger.error("xray 进程启动后立即退出，请检查配置")
+            return False
+
+        logger.info(f"✅ xray 代理已就绪: SOCKS5={PROXY_SOCKS5}  HTTP={PROXY_HTTP}")
+        return True
+    except Exception as e:
+        logger.error(f"启动代理失败: {e}")
+        return False
+
+def teardown_proxy():
+    """关闭 xray 子进程"""
+    global _xray_proc
+    if _xray_proc and _xray_proc.poll() is None:
+        _xray_proc.terminate()
+        _xray_proc.wait(timeout=5)
+        logger.info("xray 代理已关闭")
+        _xray_proc = None
+# ─────────────────────────────────────────────────────────
+
 class HidenCloud:
     def __init__(self, cookie_str, tg_config=None):
         self.base_url = "https://dash.hidencloud.com"
         self.cookie_str = cookie_str
         self.tg_config = tg_config
         self.session = requests.Session(impersonate="chrome110")
+        # 如果代理已启动，让 session 走代理
+        if _xray_proc is not None:
+            self.session.proxies = {
+                "http":  PROXY_SOCKS5,
+                "https": PROXY_SOCKS5,
+            }
         self.username = "Unknown"
         self.balance = "未知"
         self.updated_cookies = False
@@ -76,12 +198,15 @@ class HidenCloud:
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "HidenCloud-Renew-Bot"
         }
+        # GitHub API 也走代理
+        gh_proxies = {"http": PROXY_SOCKS5, "https": PROXY_SOCKS5} if _xray_proc else None
 
         try:
             # 1. 获取公钥
             pub_key_resp = requests.get(
                 f"https://api.github.com/repos/{repo}/actions/secrets/public-key",
-                headers=headers
+                headers=headers,
+                proxies=gh_proxies
             )
             if pub_key_resp.status_code != 200:
                 logger.error(f"获取公钥失败: {pub_key_resp.text}")
@@ -104,6 +229,7 @@ class HidenCloud:
             put_resp = requests.put(
                 f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}",
                 headers=headers,
+                proxies=gh_proxies,
                 json={
                     "encrypted_value": encrypted_value,
                     "key_id": key_id
@@ -504,13 +630,20 @@ def main():
         "chat_id": os.environ.get("TG_CHAT_ID") or config.get("telegram", {}).get("chat_id")
     }
 
-    for cookie_str in account_cookies:
-        if not cookie_str.strip(): continue
-        try:
-            bot = HidenCloud(cookie_str, tg_config)
-            bot.run_task()
-        except Exception as e:
-            logger.error(f"处理账号时发生异常: {e}")
+    # 代理配置：从环境变量 VMESS_LINK 读取
+    vmess_url = os.environ.get("VMESS_LINK", "")
+    setup_proxy(vmess_url)
+
+    try:
+        for cookie_str in account_cookies:
+            if not cookie_str.strip(): continue
+            try:
+                bot = HidenCloud(cookie_str, tg_config)
+                bot.run_task()
+            except Exception as e:
+                logger.error(f"处理账号时发生异常: {e}")
+    finally:
+        teardown_proxy()
 
 if __name__ == "__main__":
     main()
